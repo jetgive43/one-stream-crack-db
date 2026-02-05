@@ -375,6 +375,198 @@ if ($action) {
                 echo json_encode(['success' => true, 'id' => $id]);
                 exit;
                 
+            case 'dump_table':
+                $tableName = $_GET['table'] ?? '';
+                $format = $_GET['format'] ?? 'sql'; // sql or csv
+                
+                if (empty($tableName)) {
+                    throw new Exception('Table name is required');
+                }
+                
+                if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $tableName)) {
+                    throw new Exception('Invalid table name');
+                }
+                
+                // Get table structure
+                $columns = DB::select("
+                    SELECT 
+                        column_name,
+                        data_type,
+                        character_maximum_length,
+                        is_nullable,
+                        column_default
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = ?
+                    ORDER BY ordinal_position
+                ", [$tableName]);
+                
+                // Get all data
+                $data = DB::table($tableName)->get();
+                
+                if ($format === 'csv') {
+                    // CSV format
+                    header('Content-Type: text/csv; charset=utf-8');
+                    header('Content-Disposition: attachment; filename="' . $tableName . '_' . date('Y-m-d_H-i-s') . '.csv"');
+                    
+                    $output = fopen('php://output', 'w');
+                    
+                    // Add BOM for Excel compatibility
+                    fprintf($output, chr(0xEF).chr(0xBB).chr(0xBF));
+                    
+                    // Write headers
+                    $headers = array_map(function($col) { return $col->column_name; }, $columns);
+                    fputcsv($output, $headers);
+                    
+                    // Write data
+                    foreach ($data as $row) {
+                        $values = [];
+                        $rowArray = (array)$row;
+                        foreach ($columns as $col) {
+                            $value = $rowArray[$col->column_name] ?? null;
+                            if ($value === null) {
+                                $values[] = '';
+                            } else {
+                                // Convert objects/arrays to JSON for CSV
+                                if (is_object($value) || is_array($value)) {
+                                    $values[] = json_encode($value);
+                                } else {
+                                    $values[] = $value;
+                                }
+                            }
+                        }
+                        fputcsv($output, $values);
+                    }
+                    
+                    fclose($output);
+                    exit;
+                } else {
+                    // SQL format
+                    header('Content-Type: application/sql; charset=utf-8');
+                    header('Content-Disposition: attachment; filename="' . $tableName . '_' . date('Y-m-d_H-i-s') . '.sql"');
+                    
+                    $output = "-- SQL Dump for table: {$tableName}\n";
+                    $output .= "-- Generated: " . date('Y-m-d H:i:s') . "\n";
+                    $output .= "-- Total rows: " . count($data) . "\n\n";
+                    
+                    // Generate CREATE TABLE statement
+                    $output .= "DROP TABLE IF EXISTS \"{$tableName}\" CASCADE;\n\n";
+                    $output .= "CREATE TABLE \"{$tableName}\" (\n";
+                    
+                    $columnDefs = [];
+                    foreach ($columns as $col) {
+                        $def = "  \"{$col->column_name}\" ";
+                        
+                        // Map PostgreSQL types
+                        switch ($col->data_type) {
+                            case 'character varying':
+                                $def .= "VARCHAR(" . ($col->character_maximum_length ?? 255) . ")";
+                                break;
+                            case 'character':
+                                $def .= "CHAR(" . ($col->character_maximum_length ?? 1) . ")";
+                                break;
+                            case 'text':
+                                $def .= "TEXT";
+                                break;
+                            case 'integer':
+                                $def .= "INTEGER";
+                                break;
+                            case 'bigint':
+                                $def .= "BIGINT";
+                                break;
+                            case 'smallint':
+                                $def .= "SMALLINT";
+                                break;
+                            case 'numeric':
+                            case 'decimal':
+                                $def .= "NUMERIC";
+                                break;
+                            case 'real':
+                                $def .= "REAL";
+                                break;
+                            case 'double precision':
+                                $def .= "DOUBLE PRECISION";
+                                break;
+                            case 'boolean':
+                                $def .= "BOOLEAN";
+                                break;
+                            case 'date':
+                                $def .= "DATE";
+                                break;
+                            case 'timestamp without time zone':
+                                $def .= "TIMESTAMP";
+                                break;
+                            case 'timestamp with time zone':
+                                $def .= "TIMESTAMPTZ";
+                                break;
+                            case 'time without time zone':
+                                $def .= "TIME";
+                                break;
+                            case 'json':
+                            case 'jsonb':
+                                $def .= strtoupper($col->data_type);
+                                break;
+                            default:
+                                $def .= strtoupper($col->data_type);
+                        }
+                        
+                        if ($col->is_nullable === 'NO') {
+                            $def .= " NOT NULL";
+                        }
+                        
+                        if ($col->column_default !== null) {
+                            $def .= " DEFAULT " . $col->column_default;
+                        }
+                        
+                        $columnDefs[] = $def;
+                    }
+                    
+                    $output .= implode(",\n", $columnDefs) . "\n";
+                    $output .= ");\n\n";
+                    
+                    // Generate INSERT statements
+                    if (count($data) > 0) {
+                        $columnNames = array_map(function($col) { return $col->column_name; }, $columns);
+                        
+                        // Convert collection to array
+                        $dataArray = [];
+                        foreach ($data as $row) {
+                            $dataArray[] = (array)$row;
+                        }
+                        
+                        // Batch inserts for better performance
+                        $batchSize = 100;
+                        $batches = array_chunk($dataArray, $batchSize);
+                        
+                        foreach ($batches as $batch) {
+                            $output .= "INSERT INTO \"{$tableName}\" (";
+                            $output .= '"' . implode('", "', $columnNames) . '"';
+                            $output .= ") VALUES\n";
+                            
+                            $valueRows = [];
+                            foreach ($batch as $row) {
+                                $values = [];
+                                foreach ($columnNames as $colName) {
+                                    $value = $row[$colName] ?? null;
+                                    if ($value === null) {
+                                        $values[] = 'NULL';
+                                    } else {
+                                        // Escape and quote the value
+                                        $escaped = str_replace("'", "''", $value);
+                                        $escaped = str_replace("\\", "\\\\", $escaped);
+                                        $values[] = "'" . $escaped . "'";
+                                    }
+                                }
+                                $valueRows[] = "  (" . implode(", ", $values) . ")";
+                            }
+                            
+                            $output .= implode(",\n", $valueRows) . ";\n\n";
+                        }
+                    }
+                    
+                    echo $output;
+                    exit;
+                }
+                
             default:
                 throw new Exception('Invalid action');
         }
@@ -841,6 +1033,8 @@ $dbName = $config['db_database'] ?? 'streaming_db';
                     <input type="text" id="searchInput" placeholder="Search in table...">
                 </div>
                 <div class="table-info" id="tableInfo"></div>
+                <button class="btn" onclick="dumpTable('sql')" title="Download SQL dump">📥 SQL</button>
+                <button class="btn" onclick="dumpTable('csv')" title="Download CSV dump">📥 CSV</button>
                 <button class="btn btn-primary" onclick="addNewRecord()" style="margin-left: auto;">+ Add New</button>
             </div>
             
@@ -1295,6 +1489,21 @@ $dbName = $config['db_database'] ?? 'streaming_db';
         
         function closeEditModal() {
             document.getElementById('editModal').style.display = 'none';
+        }
+        
+        function dumpTable(format) {
+            if (!currentTable) {
+                alert('Please select a table first');
+                return;
+            }
+            
+            const url = `?action=dump_table&table=${encodeURIComponent(currentTable)}&format=${format}`;
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = `${currentTable}_${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.${format}`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
         }
     </script>
     
